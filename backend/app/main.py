@@ -1,0 +1,212 @@
+import asyncio
+import logging
+import os
+from contextlib import asynccontextmanager
+
+import socketio
+from fastapi import FastAPI, Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from sqlalchemy.exc import SQLAlchemyError
+
+from app.api import api_router
+from app.core.config import settings
+from app.core.database import Base, engine
+from app.models import alert, ridership, schedule, station, train, user
+from app.services import socketio_state
+from app.services.realtime import broadcast_loop
+from app.services.simulation import simulation_loop
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("metroflow")
+
+
+sio = socketio.AsyncServer(
+    async_mode="asgi",
+    # Was hardcoded to "*". The realtime feed carries occupancy for every station
+    # in the network, so a wildcard origin plus anonymous connections meant any
+    # page on the internet could subscribe to it. In production the origin list is
+    # the same one the HTTP API is restricted to, and `*` is rejected at startup.
+    cors_allowed_origins=(
+        settings.cors_origin_list
+        if settings.is_production
+        else (settings.cors_origin_list or "*")
+    ),
+    logger=True,
+    engineio_logger=False,
+)
+
+
+@sio.event
+async def connect(sid, environ, auth=None):
+    # Optional JWT auth: browsers may pass {token} via Socket.IO auth.
+    # Anonymous connections still allowed (dashboards poll otherwise),
+    # but authenticated sockets get role info + per-station rooms.
+    user_email = None
+    try:
+        token = None
+        if isinstance(auth, dict):
+            token = auth.get("token")
+        if token:
+            from app.core.security import decode_access_token
+
+            payload = decode_access_token(token)
+            user_email = payload.get("sub")
+    except Exception:
+        user_email = None
+    logger.info(f"Socket.IO client connected: {sid} user={user_email or 'anonymous'}")
+    try:
+        await sio.save_session(sid, {"user": user_email})
+    except Exception:
+        pass
+    await sio.emit("connected", {"status": "ok", "user": user_email}, to=sid)
+
+
+@sio.event
+async def disconnect(sid):
+    logger.info(f"Socket.IO client disconnected: {sid}")
+
+
+@sio.event
+async def join_station(sid, data):
+    """Join a per-station room: client emits {station_id} to receive only
+    that station's crowd_update events (plus global feed)."""
+    station_id = data.get("station_id") if isinstance(data, dict) else data
+    if station_id:
+        try:
+            await sio.enter_room(sid, f"station:{station_id}")
+            await sio.emit("joined", {"station_id": station_id}, to=sid)
+        except Exception as e:
+            logger.warning(f"join_station failed: {e}")
+
+
+@sio.event
+async def leave_station(sid, data):
+    station_id = data.get("station_id") if isinstance(data, dict) else data
+    if station_id:
+        try:
+            await sio.leave_room(sid, f"station:{station_id}")
+        except Exception:
+            pass
+
+
+@sio.event
+async def join_train(sid, data):
+    """Join a per-train room to receive only that train's `train_update`
+    events (plus the global feed)."""
+    train_id = data.get("train_id") if isinstance(data, dict) else data
+    if train_id:
+        try:
+            await sio.enter_room(sid, f"train:{train_id}")
+            await sio.emit("joined_train", {"train_id": train_id}, to=sid)
+        except Exception as e:
+            logger.warning(f"join_train failed: {e}")
+
+
+@sio.event
+async def leave_train(sid, data):
+    train_id = data.get("train_id") if isinstance(data, dict) else data
+    if train_id:
+        try:
+            await sio.leave_room(sid, f"train:{train_id}")
+        except Exception:
+            pass
+
+
+socketio_state.set_sio(sio)
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    from app.ml.model_wrappers import load_models
+
+    # Re-checked here so the guard also covers a config object constructed
+    # directly (tests, scripts) rather than only through get_settings().
+    settings.assert_production_safe()
+    if settings.is_production and os.environ.get("METROFLOW_ENABLE_SIMULATION", "1") not in (
+        "0", "", "false", "False",
+    ):
+        # The simulator writes synthetic rows into the same tables a real feed
+        # would populate, so leaving it on in production would quietly overwrite
+        # real observations with generated ones.
+        raise RuntimeError(
+            "METROFLOW_ENABLE_SIMULATION must be disabled in production: the simulator writes "
+            "synthetic ridership into the live tables and would overwrite real observations."
+        )
+
+    load_models()
+    broadcast_task = None
+    clock_task = None
+    if os.environ.get("METROFLOW_ENABLE_REALTIME", "1") not in ("0", "", "false", "False"):
+        broadcast_task = asyncio.create_task(broadcast_loop())
+        # Keeps ridership/schedules rolling forward so the "last 24h" views and
+        # prediction windows never run off the end of the generated data.
+        if os.environ.get("METROFLOW_ENABLE_SIMULATION", "1") not in ("0", "", "false", "False"):
+            clock_task = asyncio.create_task(simulation_loop())
+        logger.info("MetroFlow startup complete; realtime broadcast started")
+    else:
+        logger.info("MetroFlow startup complete; realtime broadcast disabled")
+    yield
+    logger.info("MetroFlow shutting down")
+    for task in (broadcast_task, clock_task):
+        if task is not None:
+            task.cancel()
+    for task in (broadcast_task, clock_task):
+        if task is not None:
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+
+app = FastAPI(
+    title=settings.APP_NAME,
+    version=settings.VERSION,
+    openapi_url="/api/v1/openapi.json",
+    docs_url="/api/v1/docs",
+    redoc_url=None,
+    lifespan=lifespan,
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=settings.cors_origin_list,
+    allow_methods=["*"],
+    allow_headers=["*"],
+    allow_credentials=False,
+)
+
+
+@app.exception_handler(SQLAlchemyError)
+async def sqlalchemy_exception_handler(request: Request, exc: SQLAlchemyError):
+    logger.error("Database error on %s %s: %s", request.method, request.url.path, exc)
+    return JSONResponse(
+        status_code=503,
+        content={"detail": "Database is temporarily unavailable. Please retry shortly."},
+    )
+
+
+@app.exception_handler(Exception)
+async def unhandled_exception_handler(request: Request, exc: Exception):
+    logger.exception("Unhandled error on %s %s", request.method, request.url.path)
+    return JSONResponse(
+        status_code=500,
+        content={"detail": "Internal server error. Please try again."},
+    )
+
+
+app.include_router(api_router, prefix="/api/v1")
+
+
+@app.get("/api/v1/health", tags=["health"])
+async def health() -> dict:
+    """Public, unauthenticated liveness probe used by the login screen."""
+    return {"status": "ok", "app": settings.APP_NAME, "version": settings.VERSION}
+
+
+@app.get("/")
+async def root():
+    return {"app": "MetroFlow", "api": "/api/v1/docs", "status": "running"}
+
+
+socket_app = socketio.ASGIApp(sio, other_asgi_app=app)

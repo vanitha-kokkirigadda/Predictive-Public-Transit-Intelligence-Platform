@@ -1,0 +1,49 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+
+# Node
+node_modules/
+.next/
+out/
+*.tsbuildinfo
+
+# Env
+.env
+.env.local
+.env*.local
+
+# Data (generated/scratch CSVs stay local; backend/data assets are versioned)
+data/*.csv
+!backend/data/*.csv
+
+# Test/coverage output
+coverage/
+htmlcov/
+.coverage
+frontend/coverage/
+test-results/
+playwright-report/
+
+# Large transient Kaggle/notebook/scratch outputs (keep source scripts tracked)
+kaggle/**/checkpoint_*.pkl
+kaggle/*_outputs/
+nj_transit_delay_outputs/
+
+# Local dev artifacts
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+*.sqlite3
+*.log
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

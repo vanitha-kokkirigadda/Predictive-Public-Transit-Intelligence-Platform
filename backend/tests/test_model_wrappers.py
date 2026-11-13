@@ -1,0 +1,150 @@
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+os.environ["MODELS_STORE_DIR"] = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "models_store"
+)
+
+import pytest  # noqa: E402
+
+pytest.importorskip("xgboost")
+
+from app.ml import features as feat  # noqa: E402
+from app.ml.model_wrappers import CrowdModel, DelayForecaster, DemandForecaster  # noqa: E402
+
+
+@pytest.fixture(autouse=True)
+def legacy_city_artifacts(monkeypatch):
+    """Pin the model city for this module only.
+
+    Setting METROFLOW_MODEL_CITY at import time leaked into the whole pytest
+    process: pytest imports every test module during collection, so every other
+    module (and the app's own startup) then resolved `hangzhou` and loaded the
+    legacy 10-station artifact instead of the NYC one. Scoping it to a fixture
+    keeps the rest of the suite on the configured city.
+    """
+    monkeypatch.setenv("METROFLOW_MODEL_CITY", "hangzhou")
+
+
+def test_crowd_model_serves_city_artifact():
+    m = CrowdModel()
+    assert m.is_loaded
+    assert m.is_kaggle
+    out = m.predict_hourly(8, hours_ahead=6, weekday=2, station={"id": "ST01", "capacity_per_hour": 520})
+    assert len(out) == 6
+    assert all(0 < p["predicted_occupancy_pct"] <= 120 for p in out)
+
+
+def test_crowd_prediction_is_not_fallback_baseline():
+    m = CrowdModel()
+    base = [feat.station_baseline_occupancy_pct((8 + i) % 24) * 100 for i in range(6)]
+    out = m.predict_hourly(8, hours_ahead=6, weekday=2, station={"id": "ST01", "capacity_per_hour": 520})
+    assert [round(p["predicted_occupancy_pct"], 2) for p in out] != [round(b, 2) for b in base]
+
+
+def test_demand_model_serves_city_artifact():
+    m = DemandForecaster()
+    out = m.forecast_hourly(8, hours_ahead=6, weekday=2, station={"id": "ST01", "capacity_per_hour": 520})
+    assert len(out) == 6
+    assert all(d["predicted_entries"] >= 0 for d in out)
+
+
+def test_predictions_differ_per_station():
+    cm = CrowdModel()
+    dm = DemandForecaster()
+    a = cm.predict_hourly(8, hours_ahead=6, weekday=2, station={"id": "ST01", "capacity_per_hour": 520})
+    b = cm.predict_hourly(8, hours_ahead=6, weekday=2, station={"id": "ST02", "capacity_per_hour": 430})
+    assert [p["predicted_occupancy_pct"] for p in a] != [p["predicted_occupancy_pct"] for p in b]
+    da = dm.forecast_hourly(8, hours_ahead=6, weekday=2, station={"id": "ST01", "capacity_per_hour": 520})
+    db = dm.forecast_hourly(8, hours_ahead=6, weekday=2, station={"id": "ST02", "capacity_per_hour": 430})
+    assert [p["predicted_entries"] for p in da] != [p["predicted_entries"] for p in db]
+
+
+def test_delay_model_serves_artifact():
+    m = DelayForecaster()
+    if not m.is_loaded:
+        pytest.skip("NJ delay artifacts not present")
+    out = m.predict(hour=8, weekday=0, sched_minutes=8 * 60 + 30, stop_sequence=1.0,
+                    line="Northeast Corrdr", from_station="105", to_station="38187")
+    assert out["predicted_delay_minutes"] >= 0
+    assert out["delay_bucket"] in m.classes
+    assert abs(sum(out["probabilities"].values()) - 1.0) < 1e-3
+
+
+def test_delay_prediction_differs_by_line():
+    m = DelayForecaster()
+    if not m.is_loaded:
+        pytest.skip("NJ delay artifacts not present")
+    a = m.predict(hour=8, weekday=0, sched_minutes=8 * 60 + 30, stop_sequence=1.0,
+                  line="Princeton Shuttle", from_station="105", to_station="38187")
+    b = m.predict(hour=8, weekday=0, sched_minutes=8 * 60 + 30, stop_sequence=1.0,
+                  line="Atl. City Line", from_station="107", to_station="63")
+    assert a != b
+
+
+def _delay_fit(out: dict) -> dict:
+    """Model output without the request echo (line/from/to), which simply
+    mirrors the caller's spelling and is identical for identical rows."""
+    return {k: v for k, v in out.items() if k not in ("line", "from_station", "to_station")}
+
+
+def test_delay_typo_line_alias_matches_artifact():
+    """'North Jersey Coast' must resolve to the artifact's 'No Jersey Coast'
+    (the upstream dataset's typo), not to an all-zero one-hot."""
+    m = DelayForecaster()
+    if not m.is_loaded:
+        pytest.skip("NJ delay artifacts not present")
+    alias = m.predict(hour=8, weekday=0, sched_minutes=510, stop_sequence=1.0,
+                      line="North Jersey Coast", from_station="", to_station="")
+    canonical = m.predict(hour=8, weekday=0, sched_minutes=510, stop_sequence=1.0,
+                          line="No Jersey Coast", from_station="", to_station="")
+    unknown = m.predict(hour=8, weekday=0, sched_minutes=510, stop_sequence=1.0,
+                        line="Phantom Line", from_station="", to_station="")
+    assert _delay_fit(alias) == _delay_fit(canonical)
+    assert _delay_fit(alias) != _delay_fit(unknown)
+
+
+def test_delay_bergen_line_trailing_space_ignored():
+    """The artifact keeps 'Bergen Co. Line ' (trailing space); the clean UI
+    label must map onto the same one-hot."""
+    m = DelayForecaster()
+    if not m.is_loaded:
+        pytest.skip("NJ delay artifacts not present")
+    clean = m.predict(hour=8, weekday=0, sched_minutes=510, stop_sequence=1.0,
+                      line="Bergen Co. Line", from_station="", to_station="")
+    raw = m.predict(hour=8, weekday=0, sched_minutes=510, stop_sequence=1.0,
+                    line="Bergen Co. Line ", from_station="", to_station="")
+    assert _delay_fit(clean) == _delay_fit(raw)
+
+
+def test_delay_station_key_normalization():
+    """Station ids must match the artifact vocabulary regardless of the
+    '105' vs '105.0' spelling, and real vocab ids must actually move the
+    prediction (i.e. the features are wired, not stuck at -1)."""
+    m = DelayForecaster()
+    if not m.is_loaded:
+        pytest.skip("NJ delay artifacts not present")
+    if not m.from_ids:
+        pytest.skip("delay artifact has no from_ids vocabulary")
+    first_id = m.from_ids[0]
+    variant_a = first_id if "." in first_id else f"{first_id}.0"
+    variant_b = first_id.split(".")[0] if "." in first_id else first_id
+    a = m.predict(hour=8, weekday=0, sched_minutes=510, stop_sequence=1.0,
+                  line="Main Line", from_station=variant_a, to_station=variant_a)
+    b = m.predict(hour=8, weekday=0, sched_minutes=510, stop_sequence=1.0,
+                  line="Main Line", from_station=variant_b, to_station=variant_b)
+    unknown = m.predict(hour=8, weekday=0, sched_minutes=510, stop_sequence=1.0,
+                        line="Main Line", from_station="99999", to_station="99999")
+    assert _delay_fit(a) == _delay_fit(b)
+    assert _delay_fit(a) != _delay_fit(unknown)
+
+
+def test_delay_model_raises_without_artifacts():
+    m = DelayForecaster()
+    m.artifact = None
+    m.regressor = None
+    with pytest.raises(RuntimeError):
+        m.predict(hour=8, weekday=0, sched_minutes=510, stop_sequence=1.0,
+                  line="Northeast Corrdr", from_station="105", to_station="38187")

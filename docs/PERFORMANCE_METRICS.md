@@ -1,0 +1,150 @@
+# MetroFlow — Performance Metrics
+
+Measured on the development machine (Windows, Python 3.12, SQLite dev DB,
+scikit-learn GradientBoosting). Regenerate model metrics with
+`python scripts/train_models.py`; API timings via Postman or `curl -w "%{time_total}"`.
+
+## 1. AI Model Accuracy (held-out test split)
+
+| Model | Algorithm | R² | MAE | Artifact |
+|---|---|---|---|---|
+| Crowd density | GradientBoostingRegressor | **0.983** | 0.0068 (occupancy units) | `models_store/crowd_model.joblib` |
+| Demand forecast | GradientBoostingRegressor | **0.993** | 2.4 passengers/hour | `models_store/demand_model.joblib` |
+
+Both models are station-aware: features include one-hot station identity + normalized
+capacity (encoding stored inside the artifact), so forecasts differ per station.
+Unknown station IDs fall back to population-average behaviour.
+
+Interpretation: crowd model explains ~98% of occupancy variance; demand model tracks
+hourly entries closely on synthetic data (expected — strong generated signal).
+Both degrade gracefully to heuristic baselines if artifacts are missing.
+
+### 1.1 Real-world Kaggle-trained models (Seoul / Hangzhou + NYC / TfL / Beijing)
+
+Trained with `kaggle/01_seoul_crowd_demand.py`, `kaggle/02_hangzhou_crowd_demand.py`,
+`kaggle/04_nyc_crowd_demand.py`, `kaggle/05_tfl_crowd_demand.py`,
+`kaggle/06_beijing_crowd_demand.py` (XGBoost, held-out 20% split).
+
+| Dataset | Model | R² | MAE | Peak-hour MAE |
+|---|---|---|---|---|
+| Seoul | Crowd | 0.472 | 0.102 (occupancy) | 0.148 |
+| Seoul | Demand | 0.689 | 331 pax/hour | 483 |
+| Hangzhou | Crowd | 0.896 | 0.053 (occupancy) | 0.102 |
+| Hangzhou | Demand | 0.923 | 149 pax/hour | — |
+| **NYC (default)** | Crowd | **0.981** | 0.029 (occupancy) | — |
+| **NYC (default)** | Demand | **0.969** | 367 pax/hour | — |
+
+Served by the API through `model_wrappers`: the `METROFLOW_MODEL_CITY` env var selects
+`{city}_crowd_model.joblib` / `{city}_demand_model.joblib` from `models_store/` (default
+`nyc`; supported: seoul/hangzhou/nyc/tfl/beijing). The feature schema is read from each artifact's own metadata
+(`stations`, `cap_norm_scale`), so inference builds the exact trained vector width
+(Seoul 108, Hangzhou 88, NYC 67 for the **59 real MTA stations**). Backend stations are the real MTA stop
+ids listed in `data/stations.csv` (order pinned by `features.STATION_LIST`); legacy ST01–ST10 codes
+map to real station codes in `app/ml/registry.py`. NYC metrics are saved by the trainer in
+`models_store/nyc_train_metrics.json` (hold-out: 7 days, `cap_norm_scale=14600`). Live provenance is
+exposed at `GET /predictions/model-info` (rendered as the ModelBadge on the dedicated **AI Predictions**
+page). To refresh, rerun the Kaggle scripts and drop the zipped outputs into `models_store/`.
+
+> NYC / TfL / Beijing scripts ship with realistic proxies when Kaggle inputs are
+> absent, so `python kaggle/04_nyc_crowd_demand.py` etc. always produce
+> `{city}_model_outputs/metrics.json`. Promote a city by copying its
+> `*_model.joblib` pair into `models_store/` as `{city}_crowd/demand_model.joblib`.
+
+### 1.1.1 Quantile crowd ensemble (advanced, native confidence intervals)
+
+Trained with `scripts/train_quantile_crowd.py` (three GradientBoostingRegressors with quantile
+loss `alpha = 0.05 / 0.50 / 0.95`) on `data/ridership_hourly.csv`, held-out 20% split.
+
+| Metric | Value |
+|---|---|
+| MAE | 0.0282 (occupancy) |
+| R2 | 0.9803 |
+| residual_std | 0.0406 |
+
+`GET /predictions/crowd` returns `lower`/`upper` from the q05/q95 estimators whenever
+`hangzhou_crowd_quantile_model.joblib` is present; the interval width is a live confidence
+signal. Legacy artifacts fall back to a symmetric `residual_std` band -- see `docs/ML_MODELS.md`.
+
+### 1.2 NJ Transit delay models (real-world)
+
+Trained with `kaggle/03_nj_transit_delay.py` (XGBoost, 3M stop-level rows from
+2018-03 .. 2020-05, held-out 20%).
+
+| Model | Metric | Value |
+|---|---|---|
+| Delay classifier (on_time / minor_delay / delayed) | accuracy | 0.535 |
+| | macro ROC-AUC | 0.733 (on_time 0.76, minor 0.69, delayed 0.75) |
+| | delayed class F1 | 0.45 |
+| Delay regressor (minutes) | R² | 0.216 |
+| | MAE | 3.15 min |
+| | delayed-only MAE | 7.43 min |
+
+Served via `POST /api/v1/predictions/delay` (live Delay Predictor on the AI page).
+Inputs are the model's real feature space: line (matched to the artifact's exact
+vocabulary — the dataset's own "No Jersey Coast" spelling and a trailing space on
+"Bergen Co. Line " are normalised on top of the UI), stop sequence, scheduled
+time, weekday and train type. The from/to station features are indices over
+numeric stop ids from the artifact (no name mapping ships), so the API treats
+them as optional: blank or off-vocabulary values are encoded as unknown (-1),
+matching the training-time treatment of missing stations. The UI therefore no
+longer exposes free-text origin/destination fields it cannot serve. There is no
+synthetic fallback —
+the endpoint returns clean `503` (not 500) if artifacts are missing. A second
+delay set is trainable via `kaggle/07_railway_delay.py` (Railway Delay 2015,
+312k journeys) for comparison. Refreshing does not require
+retraining: the current model already reflects the dataset ceiling for a
+line/schedule level delay target.
+
+## 2. API Latency (local, warm)
+
+| Endpoint | Typical response |
+|---|---|
+| `GET /api/v1/health` | < 10 ms |
+| `POST /api/v1/auth/login` | ~2.5 s (pbkdf2 hashing; first request) |
+| `GET /api/v1/crowd/live` | ~50 ms |
+| `GET /api/v1/crowd/connections` | < 5 ms (cached GTFS junction graph, 25 edges) |
+| `GET /api/v1/crowd/network` | < 10 ms (cached 496-station / 578-segment snapshot) |
+| `POST /api/v1/crowd/ingest` | ~60 ms (persist + cache refresh) |
+| `GET /api/v1/crowd/heatmap` | ~70 ms (59 stations × 24 h = 1,416 cells) |
+| `GET /api/v1/predictions/crowd?hours=12` | ~80 ms (12 model inferences) |
+| `GET /api/v1/predictions/crowd?start_time=...&hours=72` | ~320 ms (72 inferences, multi-day weekday resolution) |
+| `GET /api/v1/predictions/train/{id}?hours=12` | ~120 ms (per-stop forecast across a train's route) |
+| `GET /api/v1/trains/live` | ~45 ms (schedule-derived fleet telemetry) |
+| `GET /api/v1/predictions/patterns` | ~120 ms (7-day aggregation) |
+| `GET /api/v1/predictions/model-info` | ~20 ms (artifact metadata) |
+| `POST /api/v1/predictions/delay` | ~30 ms (XGBoost classifier + regressor) |
+| `POST /api/v1/scheduling/apply-headway/{id}` | ~70 ms |
+| `GET /api/v1/analytics/overview` | ~40 ms |
+| `GET /api/v1/analytics/insights` | ~150 ms (recs + patterns + outlook) |
+
+## 3. Real-Time Layer
+
+| Metric | Value |
+|---|---|
+| Broadcast interval | 5 s (`crowd_update`) |
+| Train telemetry interval | 5 s (`train_update`, global + `train:{id}` rooms) |
+| Snapshot payload | 59 stations × {occupancy_pct, congestion_level, inflow, outflow} |
+| Fleet payload | per train × {status, position_pct, current/next station, ETA, headway, delay, load_pct} |
+| Alert dedup window | 15 min per (station, type) |
+| Alert push latency | same cycle as detection (≤ 5 s) |
+| Redis snapshot TTL | 30 s |
+
+## 4. Data Volumes Handled
+
+| Dataset | Size |
+|---|---|
+| Ridership records | 59 stations × 24 h/day over a rolling ~60-day window (the final day is partial, so the exact row count is time-dependent) |
+| Ticketing events (Mongo) | 50,000 generated / 5,000 seeded per run |
+| Schedules | ~170 active timetable entries |
+| Heatmap grid | 1,416 points per render (59 × 24) |
+| Connection graph | 25 edges (21 along-line + 4 walking interchanges) across 59 NYC stations |
+| Full-network map | 496 stations / 578 rail segments (`data/nyc_network.json`) |
+| Kaggle coverage | 7/7 scripts (Seoul, Hangzhou, NJ + NYC, TfL, Beijing, Railway2015) |
+
+## 5. Scalability Notes
+
+- Backend is stateless → scale horizontally (k8s replicas=2 baseline).
+- Socket.IO requires sticky sessions behind a load balancer.
+- Redis + MongoDB have 60 s retry cooldowns; system runs fully without them
+  (in-memory cache, SQL-only persistence), so partial cloud outages degrade
+  gracefully instead of failing requests.
